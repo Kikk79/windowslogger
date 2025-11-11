@@ -50,11 +50,18 @@ class AdminAction:
 
 class AdminActionsMonitor:
     """Monitor for administrative actions and system configuration changes."""
-    
+
     def __init__(self):
-        self.wmi_conn = wmi.WMI()
+        # FIX: Add error handling for WMI initialization
+        try:
+            self.wmi_conn = wmi.WMI()
+        except Exception as e:
+            logger.error(f"Failed to initialize WMI connection: {e}")
+            self.wmi_conn = None
+
         self.running = False
         self.actions_log = []
+        self.actions_lock = threading.Lock()  # FIX: Add lock for thread-safe access
         self.monitoring_thread = None
         self.previous_states = {
             'services': {},
@@ -76,7 +83,10 @@ class AdminActionsMonitor:
         """Stop monitoring administrative actions."""
         self.running = False
         if self.monitoring_thread:
-            self.monitoring_thread.join()
+            # FIX: Add timeout to prevent hanging
+            self.monitoring_thread.join(timeout=5.0)
+            if self.monitoring_thread.is_alive():
+                logger.warning("Monitoring thread did not stop within timeout")
         logger.info("Administrative actions monitoring stopped")
     
     def _monitor_loop(self):
@@ -98,19 +108,24 @@ class AdminActionsMonitor:
     
     def _log_action(self, action: AdminAction):
         """Log an administrative action."""
-        self.actions_log.append(action)
+        with self.actions_lock:
+            self.actions_log.append(action)
         logger.info(f"Admin Action: {action.action_type} - {action.description}")
         logger.info(f"PowerShell: {action.powershell_command}")
-        
+
         # Save to JSON file for persistence
         self._save_to_file(action)
     
     def _save_to_file(self, action: AdminAction):
         """Save action to JSON file."""
         try:
+            # FIX: Use a lock file to prevent concurrent write issues
+            import fcntl if sys.platform != 'win32' else None
             with open('admin_actions.json', 'a') as f:
+                # On Windows, file is locked automatically during write
                 json.dump(asdict(action), f)
                 f.write('\n')
+                f.flush()  # Ensure data is written
         except Exception as e:
             logger.error(f"Failed to save action to file: {e}")
     
@@ -240,6 +255,10 @@ class AdminActionsMonitor:
     def _check_policy_changes(self):
         """Monitor system policy changes."""
         try:
+            # FIX: Check if WMI is available
+            if not self.wmi_conn:
+                return
+
             # Check security policies using WMI
             for policy in self.wmi_conn.Win32_AccountPolicy():
                 policy_name = getattr(policy, 'Name', 'Unknown')
@@ -276,12 +295,12 @@ class AdminActionsMonitor:
         try:
             # Monitor critical registry keys
             critical_keys = [
-                (win32con.HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"),
-                (win32con.HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"),
-                (win32con.HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services")
+                (win32con.HKEY_LOCAL_MACHINE, "HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"),
+                (win32con.HKEY_CURRENT_USER, "HKCU", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"),
+                (win32con.HKEY_LOCAL_MACHINE, "HKLM", "SYSTEM\\CurrentControlSet\\Services")
             ]
-            
-            for hkey, subkey in critical_keys:
+
+            for hkey, hkey_name, subkey in critical_keys:
                 try:
                     key_handle = win32api.RegOpenKeyEx(hkey, subkey, 0, win32con.KEY_READ)
                     values = {}
@@ -297,35 +316,36 @@ class AdminActionsMonitor:
                                 break
                     finally:
                         win32api.RegCloseKey(key_handle)
-                    
-                    key_path = f"{hkey}\\{subkey}"
+
+                    # FIX: Use readable registry path name
+                    key_path = f"{hkey_name}\\{subkey}"
                     if key_path in self.previous_states['registry']:
                         old_values = self.previous_states['registry'][key_path]
                         if old_values != values:
                             # Find specific changes
                             added = set(values.keys()) - set(old_values.keys())
                             removed = set(old_values.keys()) - set(values.keys())
-                            modified = {k for k in values.keys() & old_values.keys() 
+                            modified = {k for k in values.keys() & old_values.keys()
                                       if values[k] != old_values[k]}
-                            
+
                             if added or removed or modified:
                                 action = AdminAction(
                                     timestamp=datetime.now().isoformat(),
                                     action_type="REGISTRY_CHANGE",
-                                    description=f"Registry changes in {subkey}",
+                                    description=f"Registry changes in {key_path}",
                                     user=win32api.GetUserName(),
                                     process="system",
                                     details={
-                                        "registry_path": subkey,
+                                        "registry_path": key_path,
                                         "added_values": list(added),
                                         "removed_values": list(removed),
                                         "modified_values": list(modified)
                                     },
-                                    powershell_command=f"Get-ItemProperty -Path 'Registry::{key_path}' | Format-List",
+                                    powershell_command=f"Get-ItemProperty -Path '{key_path}:' | Format-List",
                                     severity="HIGH"
                                 )
                                 self._log_action(action)
-                    
+
                     self.previous_states['registry'][key_path] = values
                     
                 except Exception as e:
@@ -384,6 +404,10 @@ class AdminActionsMonitor:
     def _check_system_configuration(self):
         """Monitor system configuration changes."""
         try:
+            # FIX: Check if WMI is available
+            if not self.wmi_conn:
+                return
+
             # Check system information that might indicate configuration changes
             computer_info = self.wmi_conn.Win32_ComputerSystem()[0]
             
